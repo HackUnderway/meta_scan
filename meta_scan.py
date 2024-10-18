@@ -88,7 +88,7 @@ def main():
         print(Fore.YELLOW + f"Usuario ID: {page_info.get('user_id', 'N/A')}")
         print(Fore.YELLOW + f"Redirigido a: {page_info.get('redirected_url', 'N/A')}\n")
     else:
-        print(Fore.RED + "\nNo se pudieron obtener los detalles de las publicaciones (Necesitas la API premium).")
+        print(Fore.RED + "\nNo se pudieron obtener los detalles de la página (Necesitas la API premium).")
 
     # Obtener detalles de las publicaciones
     posts_data = get_posts_details(username)
