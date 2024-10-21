@@ -19,10 +19,6 @@
 **POST:**
 https://hackunderway.com/meta-scan/
 
-# REQUIREMENTS
-```
-pip install -r requirements.txt
-```
 # USAGE
 ```
 git clone https://github.com/HackUnderway/meta_scan.git
@@ -32,6 +28,10 @@ cd meta_scan
 ```
 ```
 python3 meta_scan.py
+```
+# REQUIREMENTS
+```
+pip install -r requirements.txt
 ```
 # SUPPORT
 Questions, bugs or suggestions to : info@hackunderway.com
