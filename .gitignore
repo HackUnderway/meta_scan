@@ -1,0 +1,24 @@
+# Environment files (API keys)
+.env
+.env.local
+.env.*.local
+
+# Obsidian notes folder
+.obsidian/
+
+# Generated report files
+reports/
+*.json
+*.txt
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage

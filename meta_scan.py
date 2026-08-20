@@ -2,25 +2,31 @@
 # -*- coding: utf-8 -*-
 
 """
-meta_scan.py — OSINT para Facebook mediante RapidAPI
+meta_scan.py — OSINT para Facebook mediante RapidAPI (solo endpoints funcionales)
 Autor: HackUnderway (mejorado)
 Características:
-- API key desde .env (sin hardcodear)
+- API key desde .env o interactiva
 - requests.Session con retries + backoff
-- Timeouts configurables por CLI
-- Flags para saltar endpoints "premium" (evitar 403 si no estás suscrito)
-- Manejo de errores claro y consistente
+- Timeouts configurables
+- Múltiples endpoints del mismo host (perfil + negocio)
+- Guardado en JSON y TXT opcional
 
-Uso básico:
-  python3 meta_scan.py -u nasa --no-page --no-posts
-  python3 meta_scan.py -u nasa --connect-timeout 20 --read-timeout 60
+Uso:
+  python3 meta_scan.py -u nasa
+  python3 meta_scan.py -u nasa --no-business --out-json ./salida
+  python3 meta_scan.py --set-api
+  python3 meta_scan.py --donate
 """
 
 import os
 import sys
 import json
 import argparse
-from typing import Any, Dict, Optional, Tuple
+import time
+import random
+import string
+from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,33 +34,27 @@ from urllib3.util.retry import Retry
 
 from dotenv import load_dotenv
 import colorama
-from colorama import Fore, Back
+from colorama import Fore, Back, Style
 
 # -----------------------------
-# Constantes de endpoints
+# Constantes
 # -----------------------------
-
-# Perfil (usando el API que compartiste)
 PROFILE_HOST = "facebook-pages-scraper3.p.rapidapi.com"
-PROFILE_PATH = "/get-profile-home-page-details"   # acepta urlSupplier o url
 
-# Página y Posts (otro proveedor distinto; puede requerir suscripción)
-PAGE_HOST = "social-media-scrape.p.rapidapi.com"
-PAGE_DETAILS_PATH = "/get_facebook_pages_details"   # param: link
-POSTS_DETAILS_PATH = "/get_facebook_posts_details"  # param: link
+# Endpoints disponibles
+PROFILE_PATH = "/get-profile-home-page-details"
+BUSINESS_HOME_PATH = "/get-business-home-page-details"
+BUSINESS_ABOUT_PATH = "/get-business-about-details-page"
+BUSINESS_TRANSPARENCY_PATH = "/get-business-about-profile-transparency-page-details"
 
-# Ajustes de red
-DEFAULT_TIMEOUT: Tuple[int, int] = (15, 45)  # (connect, read) en segundos
+DEFAULT_TIMEOUT: Tuple[int, int] = (15, 45)
 MAX_RETRIES = 3
 BACKOFF_FACTOR = 0.6
 
-
 # -----------------------------
-# Utilidades de red / sesión
+# Configuración de sesión
 # -----------------------------
-
 def build_session() -> requests.Session:
-    """Crea una sesión requests con reintentos/backoff y User-Agent."""
     session = requests.Session()
     retries = Retry(
         total=MAX_RETRIES,
@@ -66,33 +66,33 @@ def build_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update({"User-Agent": "meta-scan/1.0 (+https://github.com/HackUnderway/meta_scan)"})
+    session.headers.update({"User-Agent": "meta-scan/2.0 (+https://github.com/HackUnderway/meta_scan)"})
     return session
 
+# -----------------------------
+# Manejo de API Key
+# -----------------------------
+def setup_api_key() -> str:
+    print(Fore.YELLOW + "\n🔑 Configuración inicial de API Key\n")
+    key = input("👉 Introduce tu clave de RapidAPI: ").strip()
+    if not key:
+        print(Fore.RED + "❌ Clave vacía. Saliendo.")
+        sys.exit(1)
+    with open(".env", "w") as f:
+        f.write(f"RAPIDAPI_KEY={key}\n")
+    print(Fore.GREEN + "✅ RAPIDAPI_KEY guardada en .env\n")
+    return key
 
-def get_env_keys() -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    Lee claves del .env:
-    - RAPIDAPI_KEY               (común para todas las APIs)
-    - RAPIDAPI_KEY_FB_SCRAPER3   (opcional, específica)
-    - RAPIDAPI_KEY_SOCIAL_SCRAPE (opcional, específica)
-    """
+def get_api_key() -> str:
     load_dotenv()
-    common = os.getenv("RAPIDAPI_KEY")
-    fb_key = os.getenv("RAPIDAPI_KEY_FB_SCRAPER3", None)
-    social_key = os.getenv("RAPIDAPI_KEY_SOCIAL_SCRAPE", None)
-    if not common and not (fb_key or social_key):
-        raise RuntimeError(
-            "No se encontró RAPIDAPI_KEY en .env (o RAPIDAPI_KEY_FB_SCRAPER3 / RAPIDAPI_KEY_SOCIAL_SCRAPE)."
-        )
-    return common or "", fb_key, social_key
+    key = os.getenv("RAPIDAPI_KEY")
+    if not key:
+        key = setup_api_key()
+    return key
 
-
-def choose_key(common: str, specific: Optional[str]) -> str:
-    """Usa la clave específica si existe; si no, la común."""
-    return specific.strip() if (specific and specific.strip()) else common
-
-
+# -----------------------------
+# Llamadas a la API
+# -----------------------------
 def rapidapi_get(
     session: requests.Session,
     host: str,
@@ -101,101 +101,53 @@ def rapidapi_get(
     api_key: str,
     timeout: Tuple[int, int] = DEFAULT_TIMEOUT
 ) -> Dict[str, Any]:
-    """GET a RapidAPI host con manejo de errores y JSON estricto."""
     url = f"https://{host}{path}"
     headers = {
         "x-rapidapi-host": host,
         "x-rapidapi-key": api_key,
     }
-
     try:
         resp = session.get(url, headers=headers, params=params, timeout=timeout)
-    except requests.exceptions.ConnectTimeout:
-        raise RuntimeError(
-            f"Connection timeout al conectar con {host}. "
-            f"Prueba subir --connect-timeout o verifica tu red/VPN/Proxy."
-        )
-    except requests.exceptions.ReadTimeout:
-        raise RuntimeError(
-            f"Read timeout leyendo respuesta de {host}. "
-            f"Prueba subir --read-timeout."
-        )
-    except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(
-            f"No se pudo conectar a {host}: {e}. "
-            f"Posibles causas: caída del proveedor, bloqueo de red/ISP, VPN/Proxy, o puerto 443 filtrado."
-        )
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Error de red al consultar {host}{path}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Error de red: {e}")
 
     if not resp.ok:
-        # Intenta parsear JSON para mensaje de error más útil
         try:
             payload = resp.json()
-        except Exception:
+        except:
             payload = {"error": (resp.text or "")[:300]}
         raise RuntimeError(
             f"HTTP {resp.status_code} en {host}{path}. "
             f"Detalles: {json.dumps(payload, ensure_ascii=False)}"
         )
-
     try:
         return resp.json()
     except ValueError:
-        raise RuntimeError(
-            f"Respuesta no es JSON válido desde {host}{path}: {(resp.text or '')[:300]}"
-        )
+        raise RuntimeError(f"Respuesta no JSON: {(resp.text or '')[:300]}")
 
+def get_profile_details(session, username, api_key):
+    url = f"https://www.facebook.com/{username}"
+    params = {"urlSupplier": url, "url": url}
+    return rapidapi_get(session, PROFILE_HOST, PROFILE_PATH, params, api_key)
 
-# -----------------------------
-# Funciones de negocio
-# -----------------------------
+def get_business_home_details(session, username, api_key):
+    url = f"https://www.facebook.com/{username}"
+    params = {"urlSupplier": url}
+    return rapidapi_get(session, PROFILE_HOST, BUSINESS_HOME_PATH, params, api_key)
 
-def get_profile_details(session: requests.Session, username: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Obtiene detalles del perfil con el API 'facebook-pages-scraper3'.
-    Enviamos ambos params (urlSupplier, url) para ser compatibles.
-    """
-    fb_url = f"https://www.facebook.com/{username}"
-    params = {"urlSupplier": fb_url, "url": fb_url}
-    data = rapidapi_get(session, PROFILE_HOST, PROFILE_PATH, params, api_key)
+def get_business_about_details(session, username, api_key):
+    url = f"https://www.facebook.com/{username}"
+    params = {"urlSupplier": url}
+    return rapidapi_get(session, PROFILE_HOST, BUSINESS_ABOUT_PATH, params, api_key)
 
-    # Normalización
-    if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
-        return data["data"]
-    return data if isinstance(data, dict) else None
-
-
-def get_page_details(session: requests.Session, username: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """Obtiene detalles de la página mediante 'social-media-scrape' (puede requerir suscripción)."""
-    fb_url = f"https://www.facebook.com/{username}"
-    params = {"link": fb_url}
-    data = rapidapi_get(session, PAGE_HOST, PAGE_DETAILS_PATH, params, api_key)
-
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict):
-        return data
-    return None
-
-
-def get_posts_details(session: requests.Session, username: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """Obtiene detalles de posts mediante 'social-media-scrape' (puede requerir suscripción)."""
-    fb_url = f"https://www.facebook.com/{username}"
-    params = {"link": fb_url}
-    data = rapidapi_get(session, PAGE_HOST, POSTS_DETAILS_PATH, params, api_key)
-
-    if isinstance(data, dict) and "data" in data:
-        return data
-    if isinstance(data, list):
-        return {"data": {"posts": data}}
-    return None
-
+def get_business_transparency_details(session, username, api_key):
+    url = f"https://www.facebook.com/{username}"
+    params = {"urlSupplier": url}
+    return rapidapi_get(session, PROFILE_HOST, BUSINESS_TRANSPARENCY_PATH, params, api_key)
 
 # -----------------------------
-# Presentación por consola
+# Presentación en consola
 # -----------------------------
-
 def print_banner():
     colorama.init(autoreset=True)
     print(Fore.BLUE + "   🟦🟦🟦🟦🟦🟦🟦🟦🟦")
@@ -209,87 +161,108 @@ def print_banner():
     print(Fore.BLUE + "   🟦🟦🟦🟦🟦⬜⬜🟦🟦")
     print(Back.GREEN + Fore.BLACK + "  By HackUnderway  ")
 
+def print_section(title):
+    print(Fore.CYAN + f"\n{'─' * 60}\n{title}\n{'─' * 60}")
 
-def show_profile(profile: Dict[str, Any]):
-    print(Fore.GREEN + "\nDetalles del perfil:\n")
-    print(Fore.YELLOW + f"ID: {profile.get('id', 'N/A')}")
-    print(Fore.YELLOW + f"Tipo: {profile.get('type_name', profile.get('type', 'N/A'))}")
-    print(Fore.YELLOW + f"Nombre: {profile.get('name', 'N/A')}")
-    print(Fore.YELLOW + f"Género: {profile.get('gender', 'N/A')}")
-    print(Fore.YELLOW + f"Foto de perfil: {profile.get('profile_picture', 'N/A')}")
-    print(Fore.YELLOW + f"Foto de portada: {profile.get('cover_photo', 'N/A')}\n")
-
-    intro_cards = profile.get('INTRO_CARDS') or profile.get('intro_cards') or {}
-    if isinstance(intro_cards, dict) and intro_cards:
-        print(Fore.YELLOW + "Detalles adicionales:")
-        for key, value in intro_cards.items():
-            k = str(key).replace('INTRO_CARD_', '').replace('_', ' ').title()
-            print(Fore.YELLOW + f" - {k}: {value}")
-
-    photos = profile.get('PHOTOS') or profile.get('photos')
-    if isinstance(photos, list) and photos:
-        print(Fore.YELLOW + "\nFotos:")
-        for p in photos[:20]:
-            uri = p.get('uri') or p.get('url') or 'N/A'
-            pid = p.get('id', 'N/A')
-            print(Fore.YELLOW + f" - {uri} (ID: {pid})")
-
-
-def show_page(page_info: Dict[str, Any]):
-    print(Fore.GREEN + "\nDetalles de la página:\n")
-    print(Fore.YELLOW + f"Título: {page_info.get('title', 'N/A')}")
-    print(Fore.YELLOW + f"Descripción: {page_info.get('description', 'N/A')}")
-    print(Fore.YELLOW + f"Imagen: {page_info.get('image', 'N/A')}")
-    print(Fore.YELLOW + f"URL: {page_info.get('url', 'N/A')}")
-    print(Fore.YELLOW + f"Usuario ID: {page_info.get('user_id', 'N/A')}")
-    print(Fore.YELLOW + f"Redirigido a: {page_info.get('redirected_url', 'N/A')}\n")
-
-
-def show_posts(posts_data: Dict[str, Any]):
-    posts = (((posts_data or {}).get('data') or {}).get('posts')) or []
-    if not posts:
-        print(Fore.RED + "\nNo se encontraron publicaciones (o tu plan no las incluye).")
+def show_profile(profile: Dict[str, Any], show_raw=False):
+    if show_raw:
+        print(Fore.YELLOW + json.dumps(profile, indent=2, ensure_ascii=False))
         return
 
-    print(Fore.GREEN + "\nDetalles de las publicaciones:\n")
-    for post in posts:
-        details = post.get('details', {})
-        reactions = post.get('reactions', {})
-        values = post.get('values', {})
+    print_section("📋 PERFIL")
+    # Campos principales que interesan
+    fields = [
+        ("ID", "id"),
+        ("Nombre", "name"),
+        ("Tipo", "type_name"),
+        ("Género", "gender"),
+        ("Email", "email"),
+        ("Teléfono", "phone"),
+        ("Sitio web", "website"),
+        ("Seguidores", "followers"),
+        ("Me gusta", "likes"),
+        ("Categorías", "categories"),
+        ("Rango de precios", "priceRange"),
+        ("Descripción", "best_description"),
+        ("URL del perfil", "profile_url"),
+        ("Foto de portada", "cover_photo"),
+        ("Foto de perfil (grande)", "profile_pic_large"),
+    ]
+    for label, key in fields:
+        val = profile.get(key)
+        if val is not None and val != "":
+            if isinstance(val, list):
+                val = ", ".join(str(v) for v in val)
+            print(Fore.YELLOW + f"{label:>20}: {Style.RESET_ALL}{val}")
 
-        print(Fore.YELLOW + f"Post ID: {details.get('post_id', 'N/A')}")
-        print(Fore.YELLOW + f"Texto: {values.get('text', 'N/A')}")
-        print(Fore.YELLOW + f"Reacciones totales: {reactions.get('total_reaction_count', 'N/A')}")
-        print(Fore.YELLOW + f"Comentarios: {details.get('comments_count', 'N/A')}")
-        print(Fore.YELLOW + f"Compartidos: {details.get('share_count', 'N/A')}\n")
+    # Intro Cards
+    intro = profile.get("INTRO_CARDS") or profile.get("intro_cards") or {}
+    if intro:
+        print(Fore.YELLOW + "\n📌 Información adicional:")
+        for k, v in intro.items():
+            kk = k.replace("INTRO_CARD_", "").replace("_", " ").title()
+            print(Fore.YELLOW + f"   {kk:>18}: {Style.RESET_ALL}{v}")
 
-        attachments = post.get('attachments') or []
-        for att in attachments:
-            t = att.get('__typename')
-            if t == 'Photo':
-                img = ((att.get('photo_image') or {}).get('uri')) or 'N/A'
-                print(Fore.YELLOW + f" - Imagen: {img}")
+    # Fotos (opcional, solo mostramos las primeras 5)
+    photos = profile.get("PHOTOS") or profile.get("photos") or []
+    if photos:
+        print(Fore.YELLOW + f"\n🖼️  Fotos ({len(photos)}):")
+        for p in photos[:5]:
+            uri = p.get("uri") or p.get("url") or "N/A"
+            print(Fore.YELLOW + f"   - {uri}")
 
+def show_business_home(data: Dict[str, Any], show_raw=False):
+    if show_raw:
+        print(Fore.YELLOW + json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    print_section("🏢 BUSINESS HOME")
+    # Imprime todas las claves de primer nivel
+    for k, v in data.items():
+        if isinstance(v, (str, int, float, bool)):
+            print(Fore.YELLOW + f"{k:>25}: {Style.RESET_ALL}{v}")
+
+def show_business_about(data: Dict[str, Any], show_raw=False):
+    if show_raw:
+        print(Fore.YELLOW + json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    print_section("📝 ABOUT")
+    about = data.get("about_text", "")
+    if about:
+        print(Fore.WHITE + about)
+    else:
+        print(Fore.RED + "No se encontró texto 'About'.")
+
+def show_business_transparency(data: Dict[str, Any], show_raw=False):
+    if show_raw:
+        print(Fore.YELLOW + json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    print_section("🔍 TRANSPARENCIA")
+    ad_status = data.get("ad_status", "N/A")
+    creation = data.get("creation_date", "N/A")
+    print(Fore.YELLOW + f"Estado de anuncios: {Style.RESET_ALL}{ad_status}")
+    print(Fore.YELLOW + f"Fecha de creación:  {Style.RESET_ALL}{creation}")
 
 # -----------------------------
-# Guardado opcional (JSON)
+# Guardado de resultados
 # -----------------------------
-
 def save_json_if_requested(out_dir: Optional[str], username: str,
-                           profile: Optional[Dict[str, Any]],
-                           page: Optional[Dict[str, Any]],
-                           posts: Optional[Dict[str, Any]]) -> None:
+                           profile: Optional[Dict],
+                           business_home: Optional[Dict],
+                           business_about: Optional[Dict],
+                           business_transparency: Optional[Dict]) -> None:
     if not out_dir:
         return
     try:
         os.makedirs(out_dir, exist_ok=True)
-        base = os.path.join(out_dir, username.replace("/", "_") or "output")
-
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        base = os.path.join(out_dir, f"{username}_{timestamp}_{rand}")
         payload = {
             "username": username,
             "profile": profile,
-            "page": page,
-            "posts": posts,
+            "business_home": business_home,
+            "business_about": business_about,
+            "business_transparency": business_transparency,
         }
         out_path = f"{base}.json"
         with open(out_path, "w", encoding="utf-8") as f:
@@ -298,89 +271,105 @@ def save_json_if_requested(out_dir: Optional[str], username: str,
     except Exception as e:
         print(Fore.RED + f"\n[!] Error guardando JSON: {e}")
 
-
 # -----------------------------
-# Main / CLI
+# MAIN
 # -----------------------------
-
 def main():
     print_banner()
 
     parser = argparse.ArgumentParser(description="Meta Scan OSINT para Facebook (RapidAPI)")
-    parser.add_argument("-u", "--username", help="Nombre de usuario/permalink de Facebook (ej: nasa)")
-    parser.add_argument("--no-page", action="store_true", help="No consultar detalles de página (endpoint premium).")
-    parser.add_argument("--no-posts", action="store_true", help="No consultar posts (endpoint premium).")
-    parser.add_argument("--connect-timeout", type=int, default=15, help="Timeout de conexión en segundos.")
-    parser.add_argument("--read-timeout", type=int, default=45, help="Timeout de lectura en segundos.")
-    parser.add_argument("--out-json", help="Directorio para guardar salida combinada en JSON (ej: ./salida).")
+    parser.add_argument("-u", "--username", help="Nombre de usuario/permalink de Facebook")
+    parser.add_argument("--no-business", action="store_true", help="Omitir todos los endpoints de negocio")
+    parser.add_argument("--show-raw", action="store_true", help="Mostrar JSON crudo de cada respuesta")
+    parser.add_argument("--connect-timeout", type=int, default=15, help="Timeout de conexión (segundos)")
+    parser.add_argument("--read-timeout", type=int, default=45, help="Timeout de lectura (segundos)")
+    parser.add_argument("--out-json", help="Directorio para guardar salida JSON combinada")
+    parser.add_argument("--set-api", action="store_true", help="Configurar la API key en .env")
+    parser.add_argument("--donate", action="store_true", help="Mostrar información de donación")
     args = parser.parse_args()
 
-    # Actualiza timeouts por lo pedido en CLI
-    global DEFAULT_TIMEOUT
-    DEFAULT_TIMEOUT = (args.connect-timeout if hasattr(args, "connect-timeout") else args.connect_timeout,
-                       args.read-timeout if hasattr(args, "read-timeout") else args.read_timeout)
+    if args.donate:
+        print(Fore.MAGENTA + "\n💖 Apoya el proyecto\n")
+        print(Fore.CYAN + "☕ https://buymeacoffee.com/HackUnderway")
+        print(Fore.WHITE + "🙏 ¡Gracias por tu apoyo!\n")
+        return
 
-    # Python no permite guiones en attrs; por compat, corregimos:
-    # (arriba está el fallback por si la CLI inyecta con guion; normalmente no pasa)
-    DEFAULT_TIMEOUT = (args.connect_timeout, args.read_timeout)
+    if args.set_api:
+        setup_api_key()
+        return
 
-    username = args.username or input(Fore.RED + "\n[*] Escribe tu nombre de usuario: ").strip()
+    username = args.username or input(Fore.RED + "\n[*] Introduce el nombre de usuario: ").strip()
     if not username:
         print(Fore.RED + "Usuario vacío. Saliendo.")
         sys.exit(1)
 
-    try:
-        common, fb_key, social_key = get_env_keys()
-    except Exception as e:
-        print(Fore.RED + f"[Config] {e}")
-        sys.exit(1)
-
+    api_key = get_api_key()
     session = build_session()
 
-    # Acumular resultados por si queremos guardarlos
+    # Actualizar timeouts
+    global DEFAULT_TIMEOUT
+    DEFAULT_TIMEOUT = (args.connect_timeout, args.read_timeout)
+
     profile = None
-    page = None
-    posts = None
+    business_home = None
+    business_about = None
+    business_transparency = None
 
-    # ---- Perfil (facebook-pages-scraper3)
+    # ---- Perfil (siempre)
     try:
-        profile = get_profile_details(session, username, choose_key(common, fb_key))
+        print(Fore.WHITE + f"\n🔍 Obteniendo perfil de @{username}...")
+        profile = get_profile_details(session, username, api_key)
         if profile:
-            show_profile(profile)
+            show_profile(profile, args.show_raw)
         else:
-            print(Fore.RED + "\nNo se obtuvo perfil (respuesta vacía).")
+            print(Fore.RED + "No se obtuvo perfil (respuesta vacía).")
     except Exception as e:
-        print(Fore.RED + f"\nError al obtener los detalles del perfil: {e}")
+        print(Fore.RED + f"\nError en perfil: {e}")
 
-    # ---- Página (social-media-scrape; puede requerir suscripción)
-    if not args.no_page:
+    # ---- Business endpoints (si no se omiten)
+    if not args.no_business:
+        # Business Home
         try:
-            page = get_page_details(session, username, choose_key(common, social_key))
-            if page:
-                show_page(page)
+            print(Fore.WHITE + f"\n🔍 Obteniendo datos de negocio (home) de @{username}...")
+            business_home = get_business_home_details(session, username, api_key)
+            if business_home:
+                show_business_home(business_home, args.show_raw)
             else:
-                print(Fore.RED + "\nNo se pudieron obtener los detalles de la página (¿endpoint premium?).")
+                print(Fore.RED + "No se obtuvieron datos de business home.")
         except Exception as e:
-            print(Fore.RED + f"\nError al obtener los detalles de la página: {e}")
-    else:
-        print(Fore.YELLOW + "\n[Saltado] Detalles de página por --no-page")
+            print(Fore.RED + f"\nError en business home: {e}")
 
-    # ---- Posts (social-media-scrape; puede requerir suscripción)
-    if not args.no_posts:
+        # Business About
         try:
-            posts = get_posts_details(session, username, choose_key(common, social_key))
-            if posts:
-                show_posts(posts)
+            print(Fore.WHITE + f"\n🔍 Obteniendo texto 'About' de @{username}...")
+            business_about = get_business_about_details(session, username, api_key)
+            if business_about:
+                show_business_about(business_about, args.show_raw)
             else:
-                print(Fore.RED + "\nNo se pudieron obtener los detalles de las publicaciones (¿endpoint premium?).")
+                print(Fore.RED + "No se obtuvo 'About'.")
         except Exception as e:
-            print(Fore.RED + f"\nError al obtener los detalles de las publicaciones: {e}")
+            print(Fore.RED + f"\nError en business about: {e}")
+
+        # Business Transparency
+        try:
+            print(Fore.WHITE + f"\n🔍 Obteniendo datos de transparencia de @{username}...")
+            business_transparency = get_business_transparency_details(session, username, api_key)
+            if business_transparency:
+                show_business_transparency(business_transparency, args.show_raw)
+            else:
+                print(Fore.RED + "No se obtuvieron datos de transparencia.")
+        except Exception as e:
+            print(Fore.RED + f"\nError en transparencia: {e}")
     else:
-        print(Fore.YELLOW + "\n[Saltado] Detalles de publicaciones por --no-posts")
+        print(Fore.YELLOW + "\n[Saltado] Endpoints de negocio por --no-business")
 
-    # Guardado opcional a JSON
-    save_json_if_requested(args.out_json, username, profile, page, posts)
-
+    # Guardado
+    save_json_if_requested(args.out_json, username,
+                           profile, business_home, business_about, business_transparency)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\n⚠️ Escaneo interrumpido\n")
+        sys.exit(0)
